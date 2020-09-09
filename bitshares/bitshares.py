@@ -307,7 +307,8 @@ class BitShares(AbstractGrapheneChain):
             active_accounts_authority = [[active_account["id"], 1]]
         else:
             raise ValueError(
-                "Call incomplete! Provide either a password, owner/active public keys or owner/active accounts + memo key!"
+                "Call incomplete! Provide either a password, owner/active public keys "
+                "or owner/active accounts + memo key!"
             )
 
         # additional authorities
@@ -1565,12 +1566,32 @@ class BitShares(AbstractGrapheneChain):
         self,
         amount,
         to,
-        preimage,
-        hash_type="ripemd160",
-        account=None,
+        *args, # force remaining args to be named not positional
+        hash_type=None,
+        hash_hex=None,
         expiration=60 * 60,
+        preimage=None,
+        preimage_length=0,
+        account=None,
         **kwargs
     ):
+        """Create an HTLC contract.
+
+        :param Amount amount: Amount to lock
+        :param str to: Recipient
+        :param int expiration: Contract duration in seconds
+        :param str hash_hex: Hash as string of hex digits
+        :param str preimage: Preimage as ascii string. Note hex digits would be
+            interpretted as ascii text, not as bytes. Not generally recommended
+            to use this option. Options hash_hex and preimage are mutually
+            exclusive.
+        :param int preimage_length: If non-zero, htlc contract will require
+            preimage of exact length. Generally OK to leave this as zero. Note
+            if preimage param is provided, this value SHOULD be either zero or
+            match exactly the length of the preimage, else an irredeemable htlc
+            will be created. Optionally, a sentinal value of -1 can be used to
+            compute length automatically from the preimage param.
+        """
         import hashlib
         from binascii import hexlify
         from graphenebase.base58 import ripemd160
@@ -1586,21 +1607,41 @@ class BitShares(AbstractGrapheneChain):
         if not isinstance(amount, (Amount)):
             raise ValueError("'amount' must be of type Amount")
 
+        if preimage is not None and hash_hex is not None:
+            raise ValueError("Must provide either a hash or a preimage, but not both")
+
         if hash_type == "ripemd160":
             preimage_type = 0
-            preimage_hash = hexlify(
-                ripemd160(hexlify(bytes(preimage, "utf-8")))
-            ).decode("ascii")
         elif hash_type == "sha1":
             preimage_type = 1
-            preimage_hash = hashlib.sha1(bytes(preimage, "utf-8")).hexdigest()
         elif hash_type == "sha256":
             preimage_type = 2
-            preimage_hash = hashlib.sha256(bytes(preimage, "utf-8")).hexdigest()
+        elif hash_type == "hash160":
+            preimage_type = 3
         else:
             raise ValueError(
-                "Unknown 'hash_type'. Must be 'sha1', 'sha256', or 'ripemd160'"
+                "Unknown 'hash_type'. Must be 'sha1', 'sha256', 'ripemd160', 'hash160'"
             )
+
+        if preimage is not None:
+            preimage_size = len(preimage) if preimage_length == -1 else preimage_length
+            if hash_type == "ripemd160":
+                preimage_hash = hexlify(
+                    ripemd160(hexlify(bytes(preimage, "utf-8")))
+                ).decode("ascii")
+            elif hash_type == "sha1":
+                preimage_hash = hashlib.sha1(bytes(preimage, "utf-8")).hexdigest()
+            elif hash_type == "sha256":
+                preimage_hash = hashlib.sha256(bytes(preimage, "utf-8")).hexdigest()
+            elif hash_type == "hash160":
+                preimage_hash = hexlify(ripemd160(
+                        hashlib.sha256(bytes(preimage, "utf-8")).hexdigest()
+                )).decode("ascii")
+        elif hash_hex is not None:
+            preimage_hash = hexlify(bytes.fromhex(hash_hex)).decode("ascii")
+            preimage_size = preimage_length
+        else:
+            raise ValueError("Must provide either a hash or a preimage")
 
         op = operations.Htlc_create(
             **{
@@ -1609,14 +1650,20 @@ class BitShares(AbstractGrapheneChain):
                 "to": to["id"],
                 "amount": amount.json(),
                 "preimage_hash": [preimage_type, preimage_hash],
-                "preimage_size": len(preimage),
+                "preimage_size": preimage_size,
                 "claim_period_seconds": expiration,
                 "extensions": [],
             }
         )
         return self.finalizeOp(op, account, "active", **kwargs)
 
-    def htlc_redeem(self, htlc_id, preimage, account=None, **kwargs):
+
+    def htlc_redeem(self, htlc_id, preimage, encoding="utf-8", account=None, **kwargs):
+        """Redeem an htlc contract
+
+        :param str preimage: The preimage that unlocks the htlc
+        :param str encoding: "utf-8", ..., or "hex"
+        """
         from binascii import hexlify
 
         htlc = Htlc(htlc_id, blockchain_instance=self)
@@ -1627,12 +1674,92 @@ class BitShares(AbstractGrapheneChain):
             account = htlc["to"]
         account = Account(account, blockchain_instance=self)
 
+        if encoding=="hex":
+            preimage_hex = hexlify(bytes.fromhex(preimage)).decode("ascii")
+        else:
+            preimage_hex = hexlify(bytes(preimage, encoding)).decode("ascii")
+
         op = operations.Htlc_redeem(
             **{
                 "fee": {"amount": 0, "asset_id": "1.3.0"},
                 "redeemer": account["id"],
-                "preimage": hexlify(bytes(preimage, "utf-8")).decode("ascii"),
+                "preimage": preimage_hex,
                 "htlc_id": htlc["id"],
+                "extensions": [],
+            }
+        )
+        return self.finalizeOp(op, account, "active", **kwargs)
+
+
+    def create_voting_ticket(self, target_type, amount_to_lock, account=None, **kwargs):
+        """ Create a voting ticket
+
+        :param int,str target_type: Lock period target. Should be a string from
+                    operations.ticket_type_strings or the index of the intended
+                    string.
+
+        :param Amount amount_to_lock: Amount to lock up for the duration
+                    selected in target_type.
+        """
+
+        if not account:
+            if "default_account" in self.config:
+                account = self.config["default_account"]
+        if not account:
+            raise ValueError("You need to provide an account")
+        account = Account(account, blockchain_instance=self)
+
+        if not isinstance(amount_to_lock, (Amount)):
+            raise ValueError("'amount_to_lock' must be of type Amount")
+
+        op = operations.Ticket_create_operation(
+            **{
+                "fee": {"amount": 0, "asset_id": "1.3.0"},
+                "account": account["id"],
+                "target_type": target_type,
+                "amount": amount_to_lock.json(),
+                "extensions": [],
+            }
+        )
+        return self.finalizeOp(op, account, "active", **kwargs)
+
+
+    def update_voting_ticket(self, ticket_id, new_target_type, amount_to_update,
+                             account=None, **kwargs):
+        """Update a voting ticket
+
+        :param str ticket_id: Id (e.g. "1.18.xxx") of the ticket to update.
+
+        :param int,str target_type: New lock period target. Should be a string
+                    from operations.ticket_type_strings or the index of the
+                    intended string.
+
+        :param Amount,None amount_to_update: Amount to move over to the new
+                    lock-up target. (Optional - absence implies update whole
+                    amount.)
+        """
+
+        if not account:
+            if "default_account" in self.config:
+                account = self.config["default_account"]
+        if not account:
+            raise ValueError("You need to provide an account")
+        account = Account(account, blockchain_instance=self)
+
+        if isinstance(amount_to_update, (Amount)):
+            amount_to_update = amount_to_update.json()
+        elif amount_to_update is not None:
+            raise ValueError("'amount_to_update' must be of type Amount or None")
+        else:
+            pass # None is a valid value for optional field
+
+        op = operations.Ticket_update_operation(
+            **{
+                "fee": {"amount": 0, "asset_id": "1.3.0"},
+                "ticket": ticket_id,
+                "account": account["id"],
+                "target_type": new_target_type,
+                "amount_for_new_target": amount_to_update,
                 "extensions": [],
             }
         )
